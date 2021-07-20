@@ -75,6 +75,75 @@ namespace Lachain.Core.Blockchain.VM
             return true;
         }
 
+        private static int InvokeContract(
+            int callSignatureOffset, int inputLength, int inputOffset, int valueOffset, int gasOffset, InvocationType invocationType)
+        {
+            Logger.LogInformation($"InvokeContract({callSignatureOffset}, {inputLength}, {inputOffset}, {valueOffset}, {gasOffset}, {invocationType})");
+            var frame = VirtualMachine.ExecutionFrames.Peek() as WasmExecutionFrame
+                        ?? throw new InvalidOperationException("Cannot call InvokeContract outside wasm frame");
+            var snapshot = frame.InvocationContext.Snapshot;
+            var addressBuffer = SafeCopyFromMemory(frame.Memory, callSignatureOffset, 20);
+            var inputBuffer = SafeCopyFromMemory(frame.Memory, inputOffset, inputLength);
+            if (addressBuffer is null || inputBuffer is null)
+                throw new InvalidContractException("Bad call to call function");
+            var address = addressBuffer.Take(20).ToArray().ToUInt160();
+            var msgValue = SafeCopyFromMemory(frame.Memory, valueOffset, 32)?.ToUInt256();
+            var value = msgValue!.ToMoney();
+
+            if (value is null)
+                throw new InvalidContractException("Bad call to call function");
+            if (value > Money.Zero)
+            {
+                if (frame.InvocationContext.Message?.Type == InvocationType.Static)
+                {
+                    throw new InvalidOperationException("Cannot call call with non-zero value in STATICCALL");
+                }
+
+                frame.UseGas(GasMetering.TransferFundsGasCost);
+                var result = snapshot.Balances.TransferBalance(frame.CurrentAddress, address, value);
+                if (!result)
+                    throw new InsufficientFundsException();
+            }
+
+            var gasBuffer = SafeCopyFromMemory(frame.Memory, gasOffset, 8);
+            if (gasBuffer is null)
+                throw new InvalidContractException("Bad call to call function");
+            var gasLimit = gasBuffer.AsReadOnlySpan().ToUInt64();
+            if (gasLimit == 0 || gasLimit > frame.GasLimit - frame.GasUsed)
+                gasLimit = frame.GasLimit - frame.GasUsed;
+
+            InvocationMessage invocationMessage = new InvocationMessage {
+                Type = (frame.InvocationContext.Message?.Type == InvocationType.Static ? InvocationType.Static : invocationType),
+            };
+
+            switch (invocationType)
+            {
+                case InvocationType.Static:
+                case InvocationType.Regular:
+                    invocationMessage.Sender = frame.CurrentAddress;
+                    invocationMessage.Value = msgValue;
+
+                    break;
+
+                case InvocationType.Delegate:
+                    invocationMessage.Sender = frame.InvocationContext.Message?.Sender ?? frame.InvocationContext.Sender;
+                    invocationMessage.Value = frame.InvocationContext.Message?.Value ?? frame.InvocationContext.Value;
+                    invocationMessage.Delegate = frame.CurrentAddress;
+
+                    break;
+            }
+
+            var callResult = DoInternalCall(frame.CurrentAddress, address, inputBuffer, gasLimit, invocationMessage);
+            if (callResult.Status != ExecutionStatus.Ok)
+            {
+                throw new InvalidContractException($"Cannot invoke call: {callResult.Status}, {callResult.ReturnValue}");
+            }
+
+            frame.UseGas(callResult.GasUsed);
+            frame.LastChildReturnValue = callResult.ReturnValue ?? Array.Empty<byte>();
+            return 0;
+        }
+
         public static int Handler_Env_GetCallValue(int offset)
         {
             Logger.LogInformation($"Handler_Env_GetCallValue({offset})");
@@ -106,9 +175,15 @@ namespace Lachain.Core.Blockchain.VM
 
         public static void Handler_Env_WriteLog(int offset, int length)
         {
-            Logger.LogInformation($"Handler_Env_WriteLog({offset}? {length})");
+            Logger.LogInformation($"Handler_Env_WriteLog({offset}, {length})");
             var frame = VirtualMachine.ExecutionFrames.Peek() as WasmExecutionFrame
                         ?? throw new InvalidOperationException("Cannot call WRITELOG outside wasm frame");
+
+            if (frame.InvocationContext.Message?.Type == InvocationType.Static)
+            {
+                throw new InvalidOperationException("Cannot call WRITELOG in STATICCALL");
+            }
+
             var buffer = SafeCopyFromMemory(frame.Memory, offset, length);
             if (buffer == null)
                 throw new InvalidContractException("Bad call to WRITELOG");
@@ -118,48 +193,21 @@ namespace Lachain.Core.Blockchain.VM
             int callSignatureOffset, int inputLength, int inputOffset, int valueOffset, int gasOffset)
         {
             Logger.LogInformation($"Handler_Env_InvokeContract({callSignatureOffset}, {inputLength}, {inputOffset}, {valueOffset}, {gasOffset})");
-            var frame = VirtualMachine.ExecutionFrames.Peek() as WasmExecutionFrame
-                        ?? throw new InvalidOperationException("Cannot call INVOKECONTRACT outside wasm frame");
-            var snapshot = frame.InvocationContext.Snapshot;
-            var addressBuffer = SafeCopyFromMemory(frame.Memory, callSignatureOffset, 20);
-            var inputBuffer = SafeCopyFromMemory(frame.Memory, inputOffset, inputLength);
-            if (addressBuffer is null || inputBuffer is null)
-                throw new InvalidContractException("Bad call to call function");
-            var address = addressBuffer.Take(20).ToArray().ToUInt160();
-            var msgValue = SafeCopyFromMemory(frame.Memory, valueOffset, 32)?.ToUInt256();
-            var value = msgValue!.ToMoney();
-            
-            if (value is null)
-                throw new InvalidContractException("Bad call to call function");
-            if (value > Money.Zero)
-            {
-                frame.UseGas(GasMetering.TransferFundsGasCost);
-                var result = snapshot.Balances.TransferBalance(frame.CurrentAddress, address, value);
-                if (!result)
-                    throw new InsufficientFundsException();
-            }
+            return InvokeContract(callSignatureOffset, inputLength, inputOffset, valueOffset, gasOffset, InvocationType.Regular);
+        }
 
-            var gasBuffer = SafeCopyFromMemory(frame.Memory, gasOffset, 8);
-            if (gasBuffer is null)
-                throw new InvalidContractException("Bad call to call function");
-            var gasLimit = gasBuffer.AsReadOnlySpan().ToUInt64();
-            if (gasLimit == 0 || gasLimit > frame.GasLimit - frame.GasUsed)
-                gasLimit = frame.GasLimit - frame.GasUsed;
-            
-            var invocationMessage = new InvocationMessage {
-                Sender = frame.CurrentAddress,
-                Value = msgValue,
-            };
-            
-            var callResult = DoInternalCall(frame.CurrentAddress, address, inputBuffer, gasLimit, invocationMessage);
-            if (callResult.Status != ExecutionStatus.Ok)
-            {
-                throw new InvalidContractException($"Cannot invoke call: {callResult.Status}, {callResult.ReturnValue}" );
-            }
+        public static int Handler_Env_InvokeDelegateContract(
+            int callSignatureOffset, int inputLength, int inputOffset, int valueOffset, int gasOffset)
+        {
+            Logger.LogInformation($"Handler_Env_InvokeDelegateContract({callSignatureOffset}, {inputLength}, {inputOffset}, {valueOffset}, {gasOffset})");
+            return InvokeContract(callSignatureOffset, inputLength, inputOffset, valueOffset, gasOffset, InvocationType.Delegate);
+        }
 
-            frame.UseGas(callResult.GasUsed);
-            frame.LastChildReturnValue = callResult.ReturnValue ?? Array.Empty<byte>();
-            return 0;
+        public static int Handler_Env_InvokeStaticContract(
+            int callSignatureOffset, int inputLength, int inputOffset, int valueOffset, int gasOffset)
+        {
+            Logger.LogInformation($"Handler_Env_InvokeStaticContract({callSignatureOffset}, {inputLength}, {inputOffset}, {valueOffset}, {gasOffset})");
+            return InvokeContract(callSignatureOffset, inputLength, inputOffset, valueOffset, gasOffset, InvocationType.Static);
         }
 
         public static int Handler_Env_GetReturnSize()
@@ -194,7 +242,7 @@ namespace Lachain.Core.Blockchain.VM
             if (key is null) throw new InvalidContractException("Bad call to LOADSTORAGE");
             if (key.Length < 32)
                 key = _AlignTo32(key);
-            var value = frame.InvocationContext.Snapshot.Storage.GetValue(frame.CurrentAddress, key.ToUInt256());
+            var value = frame.InvocationContext.Snapshot.Storage.GetValue(frame.InvocationContext.Message?.Delegate ?? frame.CurrentAddress, key.ToUInt256());
             if (!SafeCopyToMemory(frame.Memory, value.ToBytes(), valueOffset))
                 throw new InvalidContractException("Cannot copy storageload result to memory");
         }
@@ -204,6 +252,12 @@ namespace Lachain.Core.Blockchain.VM
             Logger.LogInformation($"Handler_Env_SaveStorage({keyOffset}, {valueOffset})");
             var frame = VirtualMachine.ExecutionFrames.Peek() as WasmExecutionFrame
                         ?? throw new InvalidOperationException("Cannot call SAVESTORAGE outside wasm frame");
+
+            if (frame.InvocationContext.Message?.Type == InvocationType.Static)
+            {
+                throw new InvalidOperationException("Cannot call SAVESTORAGE in STATICCALL");
+            }
+
             frame.UseGas(GasMetering.SaveStorageGasCost);
             var key = SafeCopyFromMemory(frame.Memory, keyOffset, 32);
             if (key is null)
@@ -213,7 +267,7 @@ namespace Lachain.Core.Blockchain.VM
             var value = SafeCopyFromMemory(frame.Memory, valueOffset, 32);
             if (value is null) throw new InvalidContractException("Bad call to SAVESTORAGE");
             frame.InvocationContext.Snapshot.Storage.SetValue(
-                frame.CurrentAddress, key.ToUInt256(), value.ToUInt256()
+                frame.InvocationContext.Message?.Delegate ?? frame.CurrentAddress, key.ToUInt256(), value.ToUInt256()
             );
         }
 
@@ -554,6 +608,8 @@ namespace Lachain.Core.Blockchain.VM
                 {EnvModule, "get_call_size", CreateImport(nameof(Handler_Env_GetCallSize))},
                 {EnvModule, "copy_call_value", CreateImport(nameof(Handler_Env_CopyCallValue))},
                 {EnvModule, "invoke_contract", CreateImport(nameof(Handler_Env_InvokeContract))},
+                {EnvModule, "invoke_delegate_contract", CreateImport(nameof(Handler_Env_InvokeDelegateContract))},
+                {EnvModule, "invoke_static_contract", CreateImport(nameof(Handler_Env_InvokeStaticContract))},
                 {EnvModule, "get_return_size", CreateImport(nameof(Handler_Env_GetReturnSize))},
                 {EnvModule, "copy_return_value", CreateImport(nameof(Handler_Env_CopyReturnValue))},
                 {EnvModule, "write_log", CreateImport(nameof(Handler_Env_WriteLog))},
